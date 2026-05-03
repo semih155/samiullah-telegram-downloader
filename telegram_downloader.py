@@ -43,18 +43,17 @@ def logo_yazdir():
     print(f"""{B}
     ╔══════════════════════════════════════╗
     ║  {W}░░ SAMİULLAH DİLSUZ ░░{B}            ║
-    ║  {G}⚡ TURBO STABLE MOD v6.4 ⚡{B}         ║
+    ║  {G}⚡ TURBO STABLE MOD v6.5 ⚡{B}         ║
     ╚══════════════════════════════════════╝{RS}
     {C}   Tek Oturum • Chunk + Retry • Sabit Çalışma{RS}
     """)
 
 # ====================== İNDİRME FONKSİYONLARI ======================
 async def chunk_indir(client, msg, hedef_dosya: Path, kol_sayisi: int):
-    """Daha güvenli chunk indirme (Telegram limitlerine uyumlu)"""
     doc = msg.media.document
     boyut = doc.size
-    CHUNK_SIZE = 512 * 1024  # Telegram önerisi
-    parca = max(boyut // kol_sayisi, CHUNK_SIZE * 4)  # çok küçük parça olmasın
+    CHUNK_SIZE = 512 * 1024
+    parca = max(boyut // kol_sayisi, CHUNK_SIZE * 4)
 
     gecici = [hedef_dosya.with_suffix(f".part{i}") for i in range(kol_sayisi)]
     indirilen = [0]
@@ -101,7 +100,6 @@ async def chunk_indir(client, msg, hedef_dosya: Path, kol_sayisi: int):
     print(f"\n{Y}📦 {kol_sayisi} kol başlatılıyor... ({boyut/1024/1024:.1f} MB){RS}")
     await asyncio.gather(*[kol_indir(i) for i in range(kol_sayisi)])
 
-    # Birleştir
     print(f"\n{C}🔗 Birleştiriliyor...{RS}", end="", flush=True)
     with open(hedef_dosya, "wb") as son:
         for p in gecici:
@@ -129,14 +127,16 @@ async def standart_indir(client, msg, hedef_dosya: Path):
     await client.download_media(msg, file=str(hedef_dosya), progress_callback=cb)
 
 # ====================== WORKER ======================
-async def video_worker(worker_id, kuyruk, client, hedef_klasor, hafiza, hafiza_lock, sonuclar, kol_sayisi, sema):
+async def video_worker(worker_id, kuyruk, client, entity, hedef_klasor, hafiza, hafiza_lock, sonuclar, kol_sayisi, sema):
     while True:
         try:
             idx, toplam, msg = kuyruk.get_nowait()
         except asyncio.QueueEmpty:
             break
 
-        ham_ad = re.sub(r'[\\/:*?"<>|]', '', (msg.message or f"video_{msg.id}").split('\n')[0])[:40]
+        ham_ad = re.sub(r'[\\/:*?"<>|]', '', (msg.message or f"video_{msg.id}").split('\n')[0])[:40].strip()
+        if not ham_ad:
+            ham_ad = f"video_{msg.id}"
         dosya_adi = ham_ad + ".mp4"
         hedef_dosya = hedef_klasor / dosya_adi
         h_key = str(msg.id)
@@ -149,12 +149,13 @@ async def video_worker(worker_id, kuyruk, client, hedef_klasor, hafiza, hafiza_l
 
         print(f"\n{W}[W{worker_id}] [{idx}/{toplam}] 🚀 {dosya_adi}{RS}")
         t0 = time.time()
+        basarili = False
 
-        for deneme in range(3):  # 3 kez retry
+        for deneme in range(4):
             async with sema:
                 try:
                     boyut = msg.media.document.size
-                    if boyut > 10 * 1024 * 1024 and kol_sayisi > 1:  # büyük dosyalar için chunk
+                    if boyut > 50 * 1024 * 1024 and kol_sayisi > 1:
                         await chunk_indir(client, msg, hedef_dosya, kol_sayisi)
                     else:
                         await standart_indir(client, msg, hedef_dosya)
@@ -168,35 +169,43 @@ async def video_worker(worker_id, kuyruk, client, hedef_klasor, hafiza, hafiza_l
 
                     print(f"\n{G}✅ [{idx}/{toplam}] Tamamlandı — {sure:.1f}s | {ort_hiz:.2f} MB/s{RS}")
                     sonuclar.append(("ok", dosya_adi))
+                    basarili = True
                     break
 
                 except errors.FloodWaitError as e:
-                    print(f"\n{Y}⏳ FloodWait: {e.seconds}s bekleniyor...{RS}")
-                    await asyncio.sleep(e.seconds + 3)
-                    if deneme == 2:
-                        sonuclar.append(("hata", dosya_adi))
+                    print(f"\n{Y}⏳ FloodWait: {e.seconds}s bekleniyor... (Deneme {deneme+1}/4){RS}")
+                    await asyncio.sleep(e.seconds + 5)
 
                 except (errors.FileReferenceExpiredError, errors.FileReferenceInvalidError):
-                    print(f"\n{Y}🔄 File reference yenileniyor...{RS}")
+                    print(f"\n{Y}🔄 [{deneme+1}/4] File reference yenileniyor...{RS}")
+                    await asyncio.sleep(2)
                     try:
-                        taze_msg = await client.get_messages(msg.peer_id, ids=msg.id)
-                        msg = taze_msg  # güncelle
-                        continue
+                        # entity parametresi kullan (peer_id değil — bu kritik!)
+                        taze_msg = await client.get_messages(entity, ids=msg.id)
+                        if taze_msg:
+                            msg = taze_msg
+                            print(f"{G}✔ Yenilendi, tekrar deneniyor...{RS}")
+                            # Denemeyi sıfırlama — döngü devam edecek
+                        else:
+                            print(f"{R}Mesaj bulunamadı, atlanıyor.{RS}")
+                            break
                     except Exception as e2:
                         print(f"{R}Yenileme başarısız: {e2}{RS}")
-                        sonuclar.append(("hata", dosya_adi))
                         break
 
                 except Exception as e:
-                    print(f"\n{R}❌ [{idx}] Hata: {type(e).__name__} - {e}{RS}")
-                    # Temizlik
+                    print(f"\n{R}❌ [{idx}] Deneme {deneme+1}/4 — {type(e).__name__}: {e}{RS}")
+                    # Yarım kalan dosyaları temizle
                     for p in hedef_klasor.glob(f"{hedef_dosya.stem}.part*"):
                         p.unlink(missing_ok=True)
                     if hedef_dosya.exists() and hedef_dosya.stat().st_size == 0:
                         hedef_dosya.unlink(missing_ok=True)
-                    if deneme == 2:
-                        sonuclar.append(("hata", dosya_adi))
-                    await asyncio.sleep(2)
+                    bekleme = 3 * (deneme + 1)
+                    print(f"{Y}  {bekleme}s bekleniyor...{RS}")
+                    await asyncio.sleep(bekleme)
+
+        if not basarili:
+            sonuclar.append(("hata", dosya_adi))
 
         kuyruk.task_done()
 
@@ -237,8 +246,8 @@ async def ana_islem():
     kanal_input = input(f"{C}› Hedef Kanal/Link [{son_kanal}]: {RS}").strip() or son_kanal
     Path(LAST_LINK_FILE).write_text(kanal_input)
 
-    kol_sayisi = int(input(f"{Y}› Chunk kol sayısı (4-8 önerilir): {RS}") or "6")
-    worker_sayi = int(input(f"{Y}› Eşzamanlı video (1-3 önerilir, flood olmasın): {RS}") or "2")
+    kol_sayisi = int(input(f"{Y}› Chunk kol sayısı (2-4 önerilir, yüksek = flood riski): {RS}") or "3")
+    worker_sayi = int(input(f"{Y}› Eşzamanlı video (1 önerilir, flood olmasın): {RS}") or "1")
     adet = int(input(f"{C}› Kaç video indirelim? (0 = hepsi): {RS}") or "0")
     sira = input(f"{C}› Sıra (1=Yeni → Eski | 2=Eski → Yeni): {RS}") or "1"
 
@@ -278,14 +287,20 @@ async def ana_islem():
         await kuyruk.put((idx, len(video_listesi), msg))
 
     workers = [
-        asyncio.create_task(video_worker(i+1, kuyruk, client, hedef_klasor, hafiza, hafiza_lock, sonuclar, kol_sayisi, sema))
+        asyncio.create_task(
+            video_worker(
+                i + 1, kuyruk, client, entity,   # <-- entity buraya eklendi
+                hedef_klasor, hafiza, hafiza_lock,
+                sonuclar, kol_sayisi, sema
+            )
+        )
         for i in range(min(worker_sayi, len(video_listesi)))
     ]
 
     await asyncio.gather(*workers)
     await client.disconnect()
 
-    ok = sum(1 for s, _ in sonuclar if s == "ok")
+    ok   = sum(1 for s, _ in sonuclar if s == "ok")
     hata = sum(1 for s, _ in sonuclar if s == "hata")
     print(f"\n{G}{'═'*50}")
     print(f"  ✅ Başarılı : {ok}")
