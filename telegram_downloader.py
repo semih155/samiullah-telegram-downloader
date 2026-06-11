@@ -6,6 +6,17 @@ import sys
 import time
 from pathlib import Path
 
+# ====================== OTOMATİK GÜNCELLEME ======================
+def paket_guncelle():
+    print("\033[96m🔄 Paketler güncelleniyor...\033[0m")
+    ret = os.system(f"{sys.executable} -m pip install -q --upgrade telethon cryptg")
+    if ret == 0:
+        print("\033[92m✔ Güncel.\033[0m")
+    else:
+        print("\033[93m⚠ Güncelleme başarısız, devam ediliyor...\033[0m")
+
+paket_guncelle()
+
 def kilit_kirici():
     try:
         for f in Path(".").glob("telegram_session*"):
@@ -64,12 +75,6 @@ def progress_yazdir(indirilen, boyut, baslangic):
 
 # ====================== RESUME DESTEKLİ İNDİRME ======================
 async def resume_indir(client, entity, msg_id, hedef_dosya: Path, kol_sayisi: int):
-    """
-    - Dosya yarıda kalmışsa kaldığı yerden devam eder (resume)
-    - Her 50 MB'da file reference proaktif olarak yenilenir
-    - Expire olursa anlık yenileyip aynı offset'ten devam eder
-    """
-    # Her zaman taze mesajdan başla
     msg = await client.get_messages(entity, ids=msg_id)
     if not msg:
         raise Exception("Mesaj bulunamadı")
@@ -77,17 +82,14 @@ async def resume_indir(client, entity, msg_id, hedef_dosya: Path, kol_sayisi: in
     doc   = msg.media.document
     boyut = doc.size
 
-    YENILE_ARALIK = 50 * 1024 * 1024  # Her 50 MB'da bir proaktif yenile
+    YENILE_ARALIK = 50 * 1024 * 1024
 
-    # Resume: varsa kaldığı offset'i hesapla
     baslangic_offset = 0
     if hedef_dosya.exists():
         mevcut = hedef_dosya.stat().st_size
-        # Chunk sınırına hizala (eksik chunk'ı tekrar indir)
         baslangic_offset = (mevcut // CHUNK_SIZE) * CHUNK_SIZE
         if baslangic_offset > 0 and baslangic_offset < boyut:
             print(f"\n{Y}⏩ Resume: {baslangic_offset/1024/1024:.1f} MB'dan devam{RS}")
-            # Dosyayı hizalanmış boyuta kes
             with open(hedef_dosya, "r+b") as f:
                 f.truncate(baslangic_offset)
 
@@ -96,11 +98,8 @@ async def resume_indir(client, entity, msg_id, hedef_dosya: Path, kol_sayisi: in
         return
 
     mod = "ab" if baslangic_offset > 0 else "wb"
-
-    # Hız göstergesi için başlangıç zamanını ayarla
-    # (resume durumunda geçmiş süreyi tahmin etmek yerine sıfırdan say)
     baslangic  = time.time()
-    gosterilen = [0]  # sadece bu seferki indirilen miktar
+    gosterilen = [0]
     son_yenile = [baslangic_offset]
 
     print(f"\n{Y}📥 {boyut/1024/1024:.1f} MB — indiriliyor...{RS}")
@@ -109,7 +108,6 @@ async def resume_indir(client, entity, msg_id, hedef_dosya: Path, kol_sayisi: in
         offset = baslangic_offset
 
         while offset < boyut:
-            # Proaktif referans yenileme (expire olmadan önce)
             if offset - son_yenile[0] >= YENILE_ARALIK:
                 print(f"\n{C}🔄 Proaktif yenileme ({offset/1024/1024:.0f} MB)...{RS}", end="", flush=True)
                 try:
@@ -146,12 +144,9 @@ async def resume_indir(client, entity, msg_id, hedef_dosya: Path, kol_sayisi: in
                     gosterilen[0] += len(chunk)
                     progress_yazdir(baslangic_offset + gosterilen[0], boyut, baslangic)
 
-                # iter_download bitti demek o blok tamamlandı
-                # while döngüsü offset < boyut kontrolüyle devam eder
-                break  # tüm dosya tek seferde bitti
+                break
 
             except (errors.FileReferenceExpiredError, errors.FileReferenceInvalidError):
-                # Expire oldu — kaldığı offset korunuyor, sadece referansı yenile
                 print(f"\n{Y}🔄 File reference expire ({offset/1024/1024:.1f} MB) — yenileniyor...{RS}")
                 await asyncio.sleep(1)
                 taze = await client.get_messages(entity, ids=msg_id)
@@ -160,14 +155,14 @@ async def resume_indir(client, entity, msg_id, hedef_dosya: Path, kol_sayisi: in
                 doc = taze.media.document
                 son_yenile[0] = offset
                 print(f"{G}✔ Yenilendi → {offset/1024/1024:.1f} MB'dan devam{RS}")
-                continue  # while döngüsüne dön, aynı offset'ten devam
+                continue
 
             except errors.FloodWaitError as e:
                 print(f"\n{Y}⏳ FloodWait: {e.seconds}s bekleniyor...{RS}")
                 await asyncio.sleep(e.seconds + 5)
                 continue
 
-    print()  # Satır sonu
+    print()
 
 # ====================== WORKER ======================
 async def video_worker(worker_id, kuyruk, client, entity, hedef_klasor,
