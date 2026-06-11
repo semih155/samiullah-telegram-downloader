@@ -1,2 +1,1 @@
-# samiullah-telegram-downloader
-Telegram kanallarından video indiren hızlı ve stabil Python scripti (chunk + multi-worker)
+termux-setup-storage && pkg update -y && pkg install python git -y && git clone https://github.com/semih155/samiullah-telegram-downloader.git && cd samiullah-telegram-downloader && echo "alias telegram='python3 $(pwd)/telegram_downloader.py'" >> ~/.bashrc && source ~/.bashrc && echo -e "\n\n\033[1;32m[+] KURULUM TAMAMLANDI! Artik sadece 'telegram' yazmaniz yeterli.\033[0m\n"
