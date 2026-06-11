@@ -8,8 +8,8 @@ from pathlib import Path
 
 # ====================== OTOMATİK GÜNCELLEME ======================
 def paket_guncelle():
-    print("\033[96m🔄 Paketler güncelleniyor...\033[0m")
-    ret = os.system(f"{sys.executable} -m pip install -q --upgrade telethon cryptg")
+    print("\033[96m🔄 Paketler kontrol ediliyor...\033[0m")
+    ret = os.system(f"{sys.executable} -m pip install --upgrade --no-cache-dir telethon 2>/dev/null")
     if ret == 0:
         print("\033[92m✔ Güncel.\033[0m")
     else:
@@ -35,7 +35,7 @@ try:
     from telethon.tl.types import InputDocumentFileLocation
 except ImportError:
     print("Telethon kuruluyor...")
-    os.system(f"{sys.executable} -m pip install telethon cryptg")
+    os.system(f"{sys.executable} -m pip install telethon")
     from telethon import TelegramClient, errors
     from telethon.tl.types import InputDocumentFileLocation
 
