@@ -32,12 +32,12 @@ kilit_kirici()
 
 try:
     from telethon import TelegramClient, errors
-    from telethon.tl.types import InputDocumentFileLocation
+    from telethon.tl.types import InputDocumentFileLocation, DocumentAttributeFilename
 except ImportError:
     print("Telethon kuruluyor...")
     os.system(f"{sys.executable} -m pip install telethon")
     from telethon import TelegramClient, errors
-    from telethon.tl.types import InputDocumentFileLocation
+    from telethon.tl.types import InputDocumentFileLocation, DocumentAttributeFilename
 
 # ====================== AYARLAR ======================
 ENV_FILE       = ".env_telegram"
@@ -55,9 +55,9 @@ def logo_yazdir():
     print(f"""{B}
     ╔══════════════════════════════════════╗
     ║  {W}░░ SAMİULLAH DİLSUZ ░░{B}            ║
-    ║  {G}⚡ TURBO STABLE MOD v6.6 ⚡{B}         ║
+    ║  {G}⚡ TURBO STABLE MOD v7.0 ⚡{B}         ║
     ╚══════════════════════════════════════╝{RS}
-    {C}   Resume Destekli • File Ref Yenileme • Sabit{RS}
+    {C}   Resume Destekli • File Ref Yenileme • Video + Tüm Dosyalar{RS}
     """)
 
 # ====================== PROGRESS BAR ======================
@@ -72,6 +72,39 @@ def progress_yazdir(indirilen, boyut, baslangic):
         f"{W}{indirilen/1024/1024:.1f}/{boyut/1024/1024:.1f} MB{RS}  "
     )
     sys.stdout.flush()
+
+# ====================== DOSYA ADI/UZANTI YARDIMCI ======================
+MIME_UZANTI = {
+    "image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp",
+    "image/gif": ".gif", "video/mp4": ".mp4", "video/quicktime": ".mov",
+    "audio/mpeg": ".mp3", "audio/mp4": ".m4a", "audio/ogg": ".ogg",
+    "application/pdf": ".pdf", "application/zip": ".zip",
+    "application/x-rar-compressed": ".rar", "application/vnd.rar": ".rar",
+    "application/msword": ".doc",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
+    "text/plain": ".txt",
+}
+
+def dosya_adi_uret(msg):
+    doc = msg.media.document
+    mime = getattr(doc, 'mime_type', '') or ''
+
+    orijinal_ad = None
+    for attr in getattr(doc, 'attributes', []):
+        if isinstance(attr, DocumentAttributeFilename):
+            orijinal_ad = attr.file_name
+            break
+
+    if orijinal_ad:
+        temiz = re.sub(r'[\\/:*?"<>|]', '', orijinal_ad).strip()
+        return temiz or f"dosya_{msg.id}"
+
+    ham_ad = re.sub(r'[\\/:*?"<>|]', '', (msg.message or f"dosya_{msg.id}").split('\n')[0])[:40].strip()
+    uzanti = MIME_UZANTI.get(mime, "")
+    if not uzanti and mime:
+        alt = mime.split("/")[-1]
+        uzanti = f".{alt}" if alt else ""
+    return (ham_ad or f"dosya_{msg.id}") + uzanti
 
 # ====================== RESUME DESTEKLİ İNDİRME ======================
 async def resume_indir(client, entity, msg_id, hedef_dosya: Path, kol_sayisi: int):
@@ -256,9 +289,15 @@ async def ana_islem():
     kanal_input = input(f"{C}› Hedef Kanal/Link [{son_kanal}]: {RS}").strip() or son_kanal
     Path(LAST_LINK_FILE).write_text(kanal_input)
 
+    print(f"\n{Y}› Ne indirilsin?{RS}")
+    print(f"  {W}1{RS} = Sadece video")
+    print(f"  {W}2{RS} = Tüm dosyalar (video, foto, pdf, zip, mp3, vs. — ne varsa){RS}")
+    mod_secim = (input(f"{C}› Seçim [1]: {RS}").strip() or "1")
+    tum_dosyalar = (mod_secim == "2")
+
     kol_sayisi  = int(input(f"{Y}› Kol sayısı (1-3 önerilir, fazlası flood riski): {RS}") or "2")
-    worker_sayi = int(input(f"{Y}› Eşzamanlı video (1 önerilir): {RS}") or "1")
-    adet        = int(input(f"{C}› Kaç video? (0 = hepsi): {RS}") or "0")
+    worker_sayi = int(input(f"{Y}› Eşzamanlı indirme (1 önerilir): {RS}") or "1")
+    adet        = int(input(f"{C}› Kaç dosya? (0 = hepsi): {RS}") or "0")
     sira        = input(f"{C}› Sıra (1=Yeni→Eski | 2=Eski→Yeni): {RS}") or "1"
 
     client = await oturum_ac(int(conf['API_ID']), conf['API_HASH'], conf['PHONE'])
@@ -268,24 +307,28 @@ async def ana_islem():
     hedef_klasor = Path(STORAGE_PATH) / kanal_adi
     hedef_klasor.mkdir(parents=True, exist_ok=True)
 
-    print(f"{C}📋 Video'lar alınıyor...{RS}")
+    print(f"{C}📋 {'Dosyalar' if tum_dosyalar else 'Videolar'} alınıyor...{RS}")
     video_listesi = []
     async for m in client.iter_messages(
         entity,
         limit=adet if adet > 0 else None,
         reverse=(sira == "2")
     ):
-        if m.media and getattr(m.media, 'document', None):
-            mime = getattr(m.media.document, 'mime_type', '')
-            if mime and 'video' in mime.lower():
-                ham_ad    = re.sub(r'[\\/:*?"<>|]', '', (m.message or f"video_{m.id}").split('\n')[0])[:40].strip()
-                dosya_adi = (ham_ad or f"video_{m.id}") + ".mp4"
-                video_listesi.append((m.id, dosya_adi, m.media.document.size))
+        if not (m.media and getattr(m.media, 'document', None)):
+            continue
 
-    print(f"{G}✔ {len(video_listesi)} video bulundu.{RS}\n")
+        mime = getattr(m.media.document, 'mime_type', '') or ''
+
+        if not tum_dosyalar and 'video' not in mime.lower():
+            continue
+
+        dosya_adi = dosya_adi_uret(m)
+        video_listesi.append((m.id, dosya_adi, m.media.document.size))
+
+    print(f"{G}✔ {len(video_listesi)} dosya bulundu.{RS}\n")
 
     if not video_listesi:
-        print(f"{R}Video yok.{RS}")
+        print(f"{R}Dosya yok.{RS}")
         await client.disconnect()
         return
 
