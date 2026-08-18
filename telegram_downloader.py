@@ -32,12 +32,12 @@ kilit_kirici()
 
 try:
     from telethon import TelegramClient, errors
-    from telethon.tl.types import InputDocumentFileLocation, DocumentAttributeFilename
+    from telethon.tl.types import InputDocumentFileLocation, DocumentAttributeFilename, PeerChannel
 except ImportError:
     print("Telethon kuruluyor...")
     os.system(f"{sys.executable} -m pip install telethon")
     from telethon import TelegramClient, errors
-    from telethon.tl.types import InputDocumentFileLocation, DocumentAttributeFilename
+    from telethon.tl.types import InputDocumentFileLocation, DocumentAttributeFilename, PeerChannel
 
 # ====================== AYARLAR ======================
 ENV_FILE       = ".env_telegram"
@@ -55,10 +55,39 @@ def logo_yazdir():
     print(f"""{B}
     ╔══════════════════════════════════════╗
     ║  {W}░░ SAMİULLAH DİLSUZ ░░{B}            ║
-    ║  {G}⚡ TURBO STABLE MOD v7.0 ⚡{B}         ║
+    ║  {G}⚡ TURBO STABLE MOD v7.1 ⚡{B}         ║
     ╚══════════════════════════════════════╝{RS}
-    {C}   Resume Destekli • File Ref Yenileme • Video + Tüm Dosyalar{RS}
+    {C}   Resume Destekli • File Ref Yenileme • Link ile Tekli İndirme{RS}
     """)
+
+# ====================== LINK PARSE ======================
+def link_parse(girdi: str):
+    """
+    Döndürür: (ozel_mi, kimlik, mesaj_id)
+    - ozel_mi=True  -> kimlik bir kanal numarasıdır (t.me/c/NUMARA/ID)
+    - ozel_mi=False -> kimlik bir username veya davet linkidir
+    - mesaj_id=None -> tüm kanal modu (eski davranış)
+    - mesaj_id='...' -> tekli mesaj indirme modu
+    """
+    girdi = girdi.strip()
+
+    # t.me/c/1234567890/123  (private kanal, sayısal id)
+    m = re.match(r'(?:https?://)?(?:www\.)?t(?:elegram)?\.me/c/(\d+)(?:/(\d+))?/?(?:\?.*)?$', girdi)
+    if m:
+        return True, m.group(1), m.group(2)
+
+    # t.me/kanaladi/123  (public kanal + opsiyonel mesaj id)
+    m = re.match(r'(?:https?://)?(?:www\.)?t(?:elegram)?\.me/([A-Za-z0-9_]+)(?:/(\d+))?/?(?:\?.*)?$', girdi)
+    if m:
+        return False, m.group(1), m.group(2)
+
+    # kanaladi/123 (linksiz kısayol)
+    m = re.match(r'^([A-Za-z0-9_]+)/(\d+)$', girdi)
+    if m:
+        return False, m.group(1), m.group(2)
+
+    # sade username, davet linki (+hash), veya @kullaniciadi -> eski davranış
+    return False, girdi, None
 
 # ====================== PROGRESS BAR ======================
 def progress_yazdir(indirilen, boyut, baslangic):
@@ -286,46 +315,67 @@ async def ana_islem():
     conf = dict(line.split('=', 1) for line in Path(ENV_FILE).read_text().splitlines() if '=' in line)
 
     son_kanal   = Path(LAST_LINK_FILE).read_text().strip() if Path(LAST_LINK_FILE).exists() else ""
-    kanal_input = input(f"{C}› Hedef Kanal/Link [{son_kanal}]: {RS}").strip() or son_kanal
+    kanal_input = input(f"{C}› Hedef Kanal/Link (kanal linki veya tekli mesaj linki, örn. t.me/kanal/123) [{son_kanal}]: {RS}").strip() or son_kanal
     Path(LAST_LINK_FILE).write_text(kanal_input)
 
-    print(f"\n{Y}› Ne indirilsin?{RS}")
-    print(f"  {W}1{RS} = Sadece video")
-    print(f"  {W}2{RS} = Tüm dosyalar (video, foto, pdf, zip, mp3, vs. — ne varsa){RS}")
-    mod_secim = (input(f"{C}› Seçim [1]: {RS}").strip() or "1")
-    tum_dosyalar = (mod_secim == "2")
-
-    kol_sayisi  = int(input(f"{Y}› Kol sayısı (1-3 önerilir, fazlası flood riski): {RS}") or "2")
-    worker_sayi = int(input(f"{Y}› Eşzamanlı indirme (1 önerilir): {RS}") or "1")
-    adet        = int(input(f"{C}› Kaç dosya? (0 = hepsi): {RS}") or "0")
-    sira        = input(f"{C}› Sıra (1=Yeni→Eski | 2=Eski→Yeni): {RS}") or "1"
+    ozel_mi, kimlik, mesaj_id = link_parse(kanal_input)
 
     client = await oturum_ac(int(conf['API_ID']), conf['API_HASH'], conf['PHONE'])
-    entity = await client.get_entity(kanal_input)
+
+    if ozel_mi:
+        entity = await client.get_entity(PeerChannel(int(f"-100{kimlik}")))
+    else:
+        entity = await client.get_entity(kimlik)
 
     kanal_adi    = re.sub(r'[\\/:*?"<>|]', '', getattr(entity, 'title', 'Kanal')).strip().replace(" ", "_")
     hedef_klasor = Path(STORAGE_PATH) / kanal_adi
     hedef_klasor.mkdir(parents=True, exist_ok=True)
 
-    print(f"{C}📋 {'Dosyalar' if tum_dosyalar else 'Videolar'} alınıyor...{RS}")
-    video_listesi = []
-    async for m in client.iter_messages(
-        entity,
-        limit=adet if adet > 0 else None,
-        reverse=(sira == "2")
-    ):
-        if not (m.media and getattr(m.media, 'document', None)):
-            continue
-
-        mime = getattr(m.media.document, 'mime_type', '') or ''
-
-        if not tum_dosyalar and 'video' not in mime.lower():
-            continue
+    if mesaj_id:
+        # ---- TEKLİ MESAJ İNDİRME MODU ----
+        print(f"{C}📋 Link üzerinden tekli mesaj alınıyor (ID: {mesaj_id})...{RS}")
+        m = await client.get_messages(entity, ids=int(mesaj_id))
+        if not m or not (m.media and getattr(m.media, 'document', None)):
+            print(f"{R}Bu linkte indirilebilir bir dosya bulunamadı.{RS}")
+            await client.disconnect()
+            return
 
         dosya_adi = dosya_adi_uret(m)
-        video_listesi.append((m.id, dosya_adi, m.media.document.size))
+        video_listesi = [(m.id, dosya_adi, m.media.document.size)]
+        kol_sayisi  = int(input(f"{Y}› Kol sayısı (1-3 önerilir, fazlası flood riski): {RS}") or "2")
+        worker_sayi = 1
+    else:
+        # ---- TÜM KANAL MODU (eski davranış) ----
+        print(f"\n{Y}› Ne indirilsin?{RS}")
+        print(f"  {W}1{RS} = Sadece video")
+        print(f"  {W}2{RS} = Tüm dosyalar (video, foto, pdf, zip, mp3, vs. — ne varsa){RS}")
+        mod_secim = (input(f"{C}› Seçim [1]: {RS}").strip() or "1")
+        tum_dosyalar = (mod_secim == "2")
 
-    print(f"{G}✔ {len(video_listesi)} dosya bulundu.{RS}\n")
+        kol_sayisi  = int(input(f"{Y}› Kol sayısı (1-3 önerilir, fazlası flood riski): {RS}") or "2")
+        worker_sayi = int(input(f"{Y}› Eşzamanlı indirme (1 önerilir): {RS}") or "1")
+        adet        = int(input(f"{C}› Kaç dosya? (0 = hepsi): {RS}") or "0")
+        sira        = input(f"{C}› Sıra (1=Yeni→Eski | 2=Eski→Yeni): {RS}") or "1"
+
+        print(f"{C}📋 {'Dosyalar' if tum_dosyalar else 'Videolar'} alınıyor...{RS}")
+        video_listesi = []
+        async for m in client.iter_messages(
+            entity,
+            limit=adet if adet > 0 else None,
+            reverse=(sira == "2")
+        ):
+            if not (m.media and getattr(m.media, 'document', None)):
+                continue
+
+            mime = getattr(m.media.document, 'mime_type', '') or ''
+
+            if not tum_dosyalar and 'video' not in mime.lower():
+                continue
+
+            dosya_adi = dosya_adi_uret(m)
+            video_listesi.append((m.id, dosya_adi, m.media.document.size))
+
+        print(f"{G}✔ {len(video_listesi)} dosya bulundu.{RS}\n")
 
     if not video_listesi:
         print(f"{R}Dosya yok.{RS}")
@@ -338,8 +388,8 @@ async def ana_islem():
     sema        = asyncio.Semaphore(worker_sayi)
 
     kuyruk = asyncio.Queue()
-    for idx, (msg_id, dosya_adi, boyut) in enumerate(video_listesi, 1):
-        await kuyruk.put((idx, len(video_listesi), msg_id, dosya_adi, boyut))
+    for idx, (msg_id2, dosya_adi, boyut) in enumerate(video_listesi, 1):
+        await kuyruk.put((idx, len(video_listesi), msg_id2, dosya_adi, boyut))
 
     workers = [
         asyncio.create_task(
