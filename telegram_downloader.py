@@ -45,7 +45,14 @@ SESSION_FILE   = "telegram_session"
 STORAGE_PATH   = "/sdcard/Download"
 HAFIZA_FILE    = ".indirilenler.json"
 LAST_LINK_FILE = ".last_channel.txt"
-CHUNK_SIZE     = 512 * 1024  # 512 KB
+
+# Standart (ücretsiz) hesaplar için chunk boyutu
+CHUNK_SIZE_STANDARD = 512 * 1024   # 512 KB
+# Telegram Premium (VIP) hesaplar için chunk boyutu — daha az round-trip, daha yüksek hız
+CHUNK_SIZE_PREMIUM  = 1024 * 1024  # 1 MB
+
+# Bu, çalışma anında premium seçimine göre ayarlanır (varsayılan: standart)
+CHUNK_SIZE = CHUNK_SIZE_STANDARD
 
 G = "\033[92m"; Y = "\033[93m"; C = "\033[96m"; W = "\033[97m"
 D = "\033[2m"; RS = "\033[0m"; R = "\033[91m"; B = "\033[94m"
@@ -55,9 +62,9 @@ def logo_yazdir():
     print(f"""{B}
     ╔══════════════════════════════════════╗
     ║  {W}░░ SAMİULLAH DİLSUZ ░░{B}            ║
-    ║  {G}⚡ TURBO STABLE MOD v7.1 ⚡{B}         ║
+    ║  {G}⚡ TURBO STABLE MOD v7.2 ⚡{B}         ║
     ╚══════════════════════════════════════╝{RS}
-    {C}   Resume Destekli • File Ref Yenileme • Link ile Tekli İndirme{RS}
+    {C}   Resume Destekli • File Ref Yenileme • Link ile Tekli İndirme • VIP Hız Modu{RS}
     """)
 
 # ====================== LINK PARSE ======================
@@ -164,7 +171,7 @@ async def resume_indir(client, entity, msg_id, hedef_dosya: Path, kol_sayisi: in
     gosterilen = [0]
     son_yenile = [baslangic_offset]
 
-    print(f"\n{Y}📥 {boyut/1024/1024:.1f} MB — indiriliyor...{RS}")
+    print(f"\n{Y}📥 {boyut/1024/1024:.1f} MB — indiriliyor... ({CHUNK_SIZE//1024} KB parça){RS}")
 
     with open(hedef_dosya, mod) as f:
         offset = baslangic_offset
@@ -302,6 +309,40 @@ async def oturum_ac(api_id, api_hash, phone):
     print(f"{G}✔ Giriş başarılı!{RS}")
     return client
 
+# ====================== VIP (PREMIUM) HIZ MODU ======================
+async def vip_modu_belirle(client):
+    """
+    Kullanıcının hesabı gerçekten Telegram Premium mu diye API üzerinden kontrol eder
+    ve buna göre CHUNK_SIZE'ı ayarlar. Kontrol başarısız olursa kullanıcıya sorar.
+    """
+    global CHUNK_SIZE
+
+    premium_mi = None
+    try:
+        me = await client.get_me()
+        premium_mi = bool(getattr(me, 'premium', False))
+    except Exception:
+        premium_mi = None
+
+    if premium_mi is None:
+        secim = (input(f"{C}› Telegram Premium (VIP) hesabınız var mı? (e/h) [h]: {RS}").strip().lower() or "h")
+        premium_mi = secim.startswith("e")
+    else:
+        etiket = f"{G}Evet{RS}" if premium_mi else f"{Y}Hayır{RS}"
+        print(f"{C}› Telegram Premium durumu (otomatik tespit edildi): {etiket}")
+        secim = (input(f"{C}  VIP hız modunu kullanmak istiyor musunuz? (e/h) [{'e' if premium_mi else 'h'}]: {RS}").strip().lower())
+        if secim:
+            premium_mi = secim.startswith("e")
+
+    if premium_mi:
+        CHUNK_SIZE = CHUNK_SIZE_PREMIUM
+        print(f"{G}⚡ VIP Hız Modu AKTİF — {CHUNK_SIZE//1024} KB parça boyutu kullanılacak.{RS}")
+    else:
+        CHUNK_SIZE = CHUNK_SIZE_STANDARD
+        print(f"{C}Standart mod — {CHUNK_SIZE//1024} KB parça boyutu kullanılacak.{RS}")
+
+    return premium_mi
+
 # ====================== ANA ======================
 async def ana_islem():
     logo_yazdir()
@@ -321,6 +362,9 @@ async def ana_islem():
     ozel_mi, kimlik, mesaj_id = link_parse(kanal_input)
 
     client = await oturum_ac(int(conf['API_ID']), conf['API_HASH'], conf['PHONE'])
+
+    # VIP (Premium) hız modunu belirle — CHUNK_SIZE burada set edilir
+    await vip_modu_belirle(client)
 
     if ozel_mi:
         entity = await client.get_entity(PeerChannel(int(f"-100{kimlik}")))
