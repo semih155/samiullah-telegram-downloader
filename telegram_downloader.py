@@ -516,4 +516,34 @@ async def ana_islem():
 
     kuyruk = asyncio.Queue()
     for idx, (msg_id2, dosya_adi, boyut) in enumerate(video_listesi, 1):
-        await kuyruk.put((idx, len(video_listesi), msg_id2, dosya_adi, bo
+        await kuyruk.put((idx, len(video_listesi), msg_id2, dosya_adi, boyut))
+
+    workers = [
+        asyncio.create_task(
+            video_worker(
+                i + 1, kuyruk, client, entity,
+                hedef_klasor, hafiza, hafiza_lock,
+                sonuclar, kol_sayisi, sema
+            )
+        )
+        for i in range(min(worker_sayi, len(video_listesi)))
+    ]
+
+    await asyncio.gather(*workers)
+    await client.disconnect()
+
+    ok   = sum(1 for s, _ in sonuclar if s == "ok")
+    hata = sum(1 for s, _ in sonuclar if s == "hata")
+    print(f"\n{G}{'═'*50}")
+    print(f"  ✅ Başarılı : {ok}")
+    print(f"  ❌ Hatalı   : {hata}")
+    print(f"  📁 Klasör   : {hedef_klasor}")
+    print(f"{'═'*50}{RS}")
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(ana_islem())
+    except KeyboardInterrupt:
+        print(f"\n{R}👋 Kapatıldı.{RS}")
+    except Exception as e:
+        print(f"\n{R}Beklenmedik hata: {e}{RS}")
