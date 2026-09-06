@@ -62,9 +62,9 @@ def logo_yazdir():
     print(f"""{B}
     ╔══════════════════════════════════════╗
     ║  {W}░░ SAMİULLAH DİLSUZ ░░{B}            ║
-    ║  {G}⚡ TURBO STABLE MOD v7.2 ⚡{B}         ║
+    ║  {G}⚡ TURBO STABLE MOD v8.0 ⚡{B}         ║
     ╚══════════════════════════════════════╝{RS}
-    {C}   Resume Destekli • File Ref Yenileme • Link ile Tekli İndirme • VIP Hız Modu{RS}
+    {C}   Gerçek Paralel İndirme • Parça Bazlı Resume • VIP Hız Modu{RS}
     """)
 
 # ====================== LINK PARSE ======================
@@ -142,7 +142,103 @@ def dosya_adi_uret(msg):
         uzanti = f".{alt}" if alt else ""
     return (ham_ad or f"dosya_{msg.id}") + uzanti
 
-# ====================== RESUME DESTEKLİ İNDİRME ======================
+# ====================== PARÇA BAZLI DURUM KAYDI (GERÇEK RESUME) ======================
+def durum_dosya_yolu(hedef_dosya: Path) -> Path:
+    return hedef_dosya.with_name("." + hedef_dosya.name + ".durum.json")
+
+def durum_yukle(hedef_dosya: Path, boyut: int, chunk_size: int):
+    """Uyumlu bir durum dosyası varsa tamamlanan parça indexlerini döndürür, yoksa boş küme."""
+    dp = durum_dosya_yolu(hedef_dosya)
+    if not dp.exists():
+        return set()
+    try:
+        veri = json.loads(dp.read_text())
+        if veri.get("boyut") == boyut and veri.get("chunk_size") == chunk_size:
+            return set(veri.get("tamamlanan", []))
+    except Exception:
+        pass
+    return set()
+
+def durum_kaydet(hedef_dosya: Path, boyut: int, chunk_size: int, tamamlanan: set):
+    dp = durum_dosya_yolu(hedef_dosya)
+    try:
+        dp.write_text(json.dumps({"boyut": boyut, "chunk_size": chunk_size, "tamamlanan": sorted(tamamlanan)}))
+    except Exception:
+        pass
+
+def durum_sil(hedef_dosya: Path):
+    dp = durum_dosya_yolu(hedef_dosya)
+    try:
+        dp.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+# ====================== GERÇEK PARALEL + RESUME DESTEKLİ İNDİRME ======================
+async def kol_worker(client, entity, msg_id, doc_ref, doc_lock, chunk_size, boyut,
+                      kuyruk, dosya, dosya_lock, tamamlanan, tamamlanan_lock,
+                      hedef_dosya, ilerleme, ilerleme_lock, baslangic_zaman, toplam_parca):
+    while True:
+        try:
+            idx = kuyruk.get_nowait()
+        except asyncio.QueueEmpty:
+            return
+
+        offset   = idx * chunk_size
+        beklenen = min(chunk_size, boyut - offset)
+        deneme   = 0
+
+        while True:
+            doc = doc_ref[0]
+            loc = InputDocumentFileLocation(
+                id=doc.id, access_hash=doc.access_hash,
+                file_reference=doc.file_reference, thumb_size=""
+            )
+            try:
+                veri = bytearray()
+                async for parca in client.iter_download(loc, offset=offset, request_size=chunk_size, dc_id=doc.dc_id):
+                    veri += parca
+                    if len(veri) >= beklenen:
+                        break
+                veri = bytes(veri[:beklenen])
+
+                async with dosya_lock:
+                    dosya.seek(offset)
+                    dosya.write(veri)
+                    dosya.flush()
+
+                async with tamamlanan_lock:
+                    tamamlanan.add(idx)
+                    if len(tamamlanan) % 8 == 0 or len(tamamlanan) == toplam_parca:
+                        durum_kaydet(hedef_dosya, boyut, chunk_size, tamamlanan)
+
+                async with ilerleme_lock:
+                    ilerleme[0] += len(veri)
+                    progress_yazdir(ilerleme[0], boyut, baslangic_zaman)
+
+                break
+
+            except (errors.FileReferenceExpiredError, errors.FileReferenceInvalidError):
+                async with doc_lock:
+                    if doc_ref[0].id == doc.id and doc_ref[0].file_reference == doc.file_reference:
+                        taze = await client.get_messages(entity, ids=msg_id)
+                        if taze:
+                            doc_ref[0] = taze.media.document
+                await asyncio.sleep(0.5)
+                continue
+
+            except errors.FloodWaitError as e:
+                await asyncio.sleep(e.seconds + 5)
+                continue
+
+            except Exception:
+                deneme += 1
+                if deneme >= 6:
+                    raise
+                await asyncio.sleep(3 * deneme)
+                continue
+
+        kuyruk.task_done()
+
 async def resume_indir(client, entity, msg_id, hedef_dosya: Path, kol_sayisi: int):
     msg = await client.get_messages(entity, ids=msg_id)
     if not msg:
@@ -150,86 +246,62 @@ async def resume_indir(client, entity, msg_id, hedef_dosya: Path, kol_sayisi: in
 
     doc   = msg.media.document
     boyut = doc.size
+    chunk_size   = CHUNK_SIZE
+    toplam_parca = (boyut + chunk_size - 1) // chunk_size
+    kol_sayisi   = max(1, min(kol_sayisi, toplam_parca))
 
-    YENILE_ARALIK = 50 * 1024 * 1024
+    tamamlanan = durum_yukle(hedef_dosya, boyut, chunk_size)
 
-    baslangic_offset = 0
-    if hedef_dosya.exists():
-        mevcut = hedef_dosya.stat().st_size
-        baslangic_offset = (mevcut // CHUNK_SIZE) * CHUNK_SIZE
-        if baslangic_offset > 0 and baslangic_offset < boyut:
-            print(f"\n{Y}⏩ Resume: {baslangic_offset/1024/1024:.1f} MB'dan devam{RS}")
-            with open(hedef_dosya, "r+b") as f:
-                f.truncate(baslangic_offset)
+    # Dosyayı doğru boyuta hazırla (uyumsuz/eksik ise sıfırla)
+    if not hedef_dosya.exists() or hedef_dosya.stat().st_size != boyut:
+        with open(hedef_dosya, "wb") as f:
+            f.truncate(boyut)
+        tamamlanan = set()
 
-    if baslangic_offset >= boyut:
+    if len(tamamlanan) >= toplam_parca:
         print(f"\n{G}✔ Zaten tam indirilmiş.{RS}")
+        durum_sil(hedef_dosya)
         return
 
-    mod = "ab" if baslangic_offset > 0 else "wb"
-    baslangic  = time.time()
-    gosterilen = [0]
-    son_yenile = [baslangic_offset]
+    zaten_bitmis_bayt = len(tamamlanan) * chunk_size
+    if zaten_bitmis_bayt > 0:
+        print(f"\n{Y}⏩ Resume: {len(tamamlanan)}/{toplam_parca} parça zaten tamam (~{zaten_bitmis_bayt/1024/1024:.1f} MB){RS}")
 
-    print(f"\n{Y}📥 {boyut/1024/1024:.1f} MB — indiriliyor... ({CHUNK_SIZE//1024} KB parça){RS}")
+    kol_etiket = f"{kol_sayisi} kol paralel" if kol_sayisi > 1 else "tekli"
+    print(f"\n{Y}📥 {boyut/1024/1024:.1f} MB — indiriliyor... ({chunk_size//1024} KB parça, {kol_etiket}){RS}")
 
-    with open(hedef_dosya, mod) as f:
-        offset = baslangic_offset
+    kuyruk = asyncio.Queue()
+    for idx in range(toplam_parca):
+        if idx not in tamamlanan:
+            kuyruk.put_nowait(idx)
 
-        while offset < boyut:
-            if offset - son_yenile[0] >= YENILE_ARALIK:
-                print(f"\n{C}🔄 Proaktif yenileme ({offset/1024/1024:.0f} MB)...{RS}", end="", flush=True)
-                try:
-                    taze = await client.get_messages(entity, ids=msg_id)
-                    if taze:
-                        doc = taze.media.document
-                        son_yenile[0] = offset
-                        print(f" {G}✔{RS}")
-                except Exception as e:
-                    print(f" {Y}uyarı: {e}{RS}")
+    doc_ref         = [doc]
+    doc_lock        = asyncio.Lock()
+    dosya_lock      = asyncio.Lock()
+    tamamlanan_lock = asyncio.Lock()
+    ilerleme_lock   = asyncio.Lock()
+    ilerleme        = [len(tamamlanan) * chunk_size]
+    baslangic       = time.time() - 0.001
 
-            loc = InputDocumentFileLocation(
-                id=doc.id,
-                access_hash=doc.access_hash,
-                file_reference=doc.file_reference,
-                thumb_size=""
-            )
+    with open(hedef_dosya, "r+b") as dosya:
+        gorevler = [
+            asyncio.create_task(kol_worker(
+                client, entity, msg_id, doc_ref, doc_lock, chunk_size, boyut,
+                kuyruk, dosya, dosya_lock, tamamlanan, tamamlanan_lock,
+                hedef_dosya, ilerleme, ilerleme_lock, baslangic, toplam_parca
+            ))
+            for _ in range(kol_sayisi)
+        ]
+        sonuclar = await asyncio.gather(*gorevler, return_exceptions=True)
 
-            try:
-                async for chunk in client.iter_download(
-                    loc,
-                    offset=offset,
-                    request_size=CHUNK_SIZE,
-                    dc_id=doc.dc_id
-                ):
-                    if offset >= boyut:
-                        break
-                    kalan = boyut - offset
-                    if len(chunk) > kalan:
-                        chunk = chunk[:kalan]
-                    f.write(chunk)
-                    f.flush()
-                    offset        += len(chunk)
-                    gosterilen[0] += len(chunk)
-                    progress_yazdir(baslangic_offset + gosterilen[0], boyut, baslangic)
+    for s in sonuclar:
+        if isinstance(s, Exception):
+            durum_kaydet(hedef_dosya, boyut, chunk_size, tamamlanan)
+            raise s
 
-                break
-
-            except (errors.FileReferenceExpiredError, errors.FileReferenceInvalidError):
-                print(f"\n{Y}🔄 File reference expire ({offset/1024/1024:.1f} MB) — yenileniyor...{RS}")
-                await asyncio.sleep(1)
-                taze = await client.get_messages(entity, ids=msg_id)
-                if not taze:
-                    raise Exception("Mesaj bulunamadı, yenileme başarısız")
-                doc = taze.media.document
-                son_yenile[0] = offset
-                print(f"{G}✔ Yenilendi → {offset/1024/1024:.1f} MB'dan devam{RS}")
-                continue
-
-            except errors.FloodWaitError as e:
-                print(f"\n{Y}⏳ FloodWait: {e.seconds}s bekleniyor...{RS}")
-                await asyncio.sleep(e.seconds + 5)
-                continue
+    durum_kaydet(hedef_dosya, boyut, chunk_size, tamamlanan)
+    if len(tamamlanan) >= toplam_parca:
+        durum_sil(hedef_dosya)
 
     print()
 
@@ -336,12 +408,23 @@ async def vip_modu_belirle(client):
 
     if premium_mi:
         CHUNK_SIZE = CHUNK_SIZE_PREMIUM
-        print(f"{G}⚡ VIP Hız Modu AKTİF — {CHUNK_SIZE//1024} KB parça boyutu kullanılacak.{RS}")
+        print(f"{G}⚡ VIP Hız Modu AKTİF — {CHUNK_SIZE//1024} KB parça boyutu, çoklu paralel bağlantı kullanılacak.{RS}")
     else:
         CHUNK_SIZE = CHUNK_SIZE_STANDARD
         print(f"{C}Standart mod — {CHUNK_SIZE//1024} KB parça boyutu kullanılacak.{RS}")
 
     return premium_mi
+
+def kol_sayisi_sor(premium_mi: bool) -> int:
+    """Kol sayısı GERÇEKTEN paralel bağlantı sayısıdır (dosyanın farklı parçaları eş zamanlı indirilir).
+    Artık hiç sormuyor, hesap tipine göre en verimli değeri otomatik seçiyor."""
+    if premium_mi:
+        otomatik = 8
+        print(f"{G}⚡ VIP tespit edildi — kol sayısı otomatik olarak {otomatik} (en verimli) seçildi.{RS}")
+    else:
+        otomatik = 4
+        print(f"{C}Standart hesap — kol sayısı otomatik olarak {otomatik} (flood riskine karşı güvenli, verimli) seçildi.{RS}")
+    return otomatik
 
 # ====================== ANA ======================
 async def ana_islem():
@@ -364,7 +447,7 @@ async def ana_islem():
     client = await oturum_ac(int(conf['API_ID']), conf['API_HASH'], conf['PHONE'])
 
     # VIP (Premium) hız modunu belirle — CHUNK_SIZE burada set edilir
-    await vip_modu_belirle(client)
+    premium_mi = await vip_modu_belirle(client)
 
     if ozel_mi:
         entity = await client.get_entity(PeerChannel(int(f"-100{kimlik}")))
@@ -386,7 +469,7 @@ async def ana_islem():
 
         dosya_adi = dosya_adi_uret(m)
         video_listesi = [(m.id, dosya_adi, m.media.document.size)]
-        kol_sayisi  = int(input(f"{Y}› Kol sayısı (1-3 önerilir, fazlası flood riski): {RS}") or "2")
+        kol_sayisi  = kol_sayisi_sor(premium_mi)
         worker_sayi = 1
     else:
         # ---- TÜM KANAL MODU (eski davranış) ----
@@ -396,7 +479,7 @@ async def ana_islem():
         mod_secim = (input(f"{C}› Seçim [1]: {RS}").strip() or "1")
         tum_dosyalar = (mod_secim == "2")
 
-        kol_sayisi  = int(input(f"{Y}› Kol sayısı (1-3 önerilir, fazlası flood riski): {RS}") or "2")
+        kol_sayisi  = kol_sayisi_sor(premium_mi)
         worker_sayi = int(input(f"{Y}› Eşzamanlı indirme (1 önerilir): {RS}") or "1")
         adet        = int(input(f"{C}› Kaç dosya? (0 = hepsi): {RS}") or "0")
         sira        = input(f"{C}› Sıra (1=Yeni→Eski | 2=Eski→Yeni): {RS}") or "1"
@@ -433,34 +516,4 @@ async def ana_islem():
 
     kuyruk = asyncio.Queue()
     for idx, (msg_id2, dosya_adi, boyut) in enumerate(video_listesi, 1):
-        await kuyruk.put((idx, len(video_listesi), msg_id2, dosya_adi, boyut))
-
-    workers = [
-        asyncio.create_task(
-            video_worker(
-                i + 1, kuyruk, client, entity,
-                hedef_klasor, hafiza, hafiza_lock,
-                sonuclar, kol_sayisi, sema
-            )
-        )
-        for i in range(min(worker_sayi, len(video_listesi)))
-    ]
-
-    await asyncio.gather(*workers)
-    await client.disconnect()
-
-    ok   = sum(1 for s, _ in sonuclar if s == "ok")
-    hata = sum(1 for s, _ in sonuclar if s == "hata")
-    print(f"\n{G}{'═'*50}")
-    print(f"  ✅ Başarılı : {ok}")
-    print(f"  ❌ Hatalı   : {hata}")
-    print(f"  📁 Klasör   : {hedef_klasor}")
-    print(f"{'═'*50}{RS}")
-
-if __name__ == "__main__":
-    try:
-        asyncio.run(ana_islem())
-    except KeyboardInterrupt:
-        print(f"\n{R}👋 Kapatıldı.{RS}")
-    except Exception as e:
-        print(f"\n{R}Beklenmedik hata: {e}{RS}")
+        await kuyruk.put((idx, len(video_listesi), msg_id2, dosya_adi, bo
